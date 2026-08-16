@@ -1,25 +1,25 @@
 {
   "name": "pi-output-styles",
   "version": "0.2.1",
-  "description": "Named, swappable, append-only system-prompt styles for Oh My Pi (OMP) and Pi — with a live /style switcher.",
-  "keywords": ["pi-package", "pi", "omp", "oh-my-pi", "extension", "output-styles", "system-prompt", "persona"],
+  "description": "Named, swappable, cache-preserving output styles for Oh My Pi (OMP) and Pi — with a live /style switcher.",
+  "keywords": ["pi-package", "pi", "omp", "oh-my-pi", "extension", "output-styles", "prompt-cache", "control-message", "persona"],
   "license": "MIT",
   "author": "LoneExile",
   "type": "module",
-  "homepage": "https://github.com/LoneExile/pi-output-styles#readme",
-  "repository": { "type": "git", "url": "git+https://github.com/LoneExile/pi-output-styles.git" },
-  "bugs": { "url": "https://github.com/LoneExile/pi-output-styles/issues" },
+  "homepage": "https://github.com/emo-eth/pi-output-styles#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/emo-eth/pi-output-styles.git" },
+  "bugs": { "url": "https://github.com/emo-eth/pi-output-styles/issues" },
   "pi": {
     "extensions": ["./extensions"],
-    "image": "https://github.com/LoneExile/pi-output-styles/raw/main/assets/demo.gif",
-    "video": "https://github.com/LoneExile/pi-output-styles/raw/main/assets/demo.mp4"
+    "image": "https://github.com/emo-eth/pi-output-styles/raw/main/assets/demo.gif",
+    "video": "https://github.com/emo-eth/pi-output-styles/raw/main/assets/demo.mp4"
   },
   "omp": {
     "name": "pi-output-styles",
-    "description": "Named, swappable, append-only system-prompt styles with a live /style switcher.",
+    "description": "Named, swappable, cache-preserving output styles with a live /style switcher.",
     "extensions": ["./extensions"],
-    "image": "https://github.com/LoneExile/pi-output-styles/raw/main/assets/demo.gif",
-    "video": "https://github.com/LoneExile/pi-output-styles/raw/main/assets/demo.mp4"
+    "image": "https://github.com/emo-eth/pi-output-styles/raw/main/assets/demo.gif",
+    "video": "https://github.com/emo-eth/pi-output-styles/raw/main/assets/demo.mp4"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

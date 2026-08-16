@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+- Live style activation, switching, and `off` now use hidden persistent control messages instead of changing the per-turn system prompt, preserving the stable system-prompt cache prefix.
+- Session resume restores the latest persisted style selection, and the active control is re-emitted once after compaction or `/clear`.
+
 ## [0.2.1] - 2026-08-08
 
 ### Added
