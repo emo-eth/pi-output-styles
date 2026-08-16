@@ -5,6 +5,9 @@
 ### Changed
 - Live style activation, switching, and `off` now use hidden persistent control messages instead of changing the per-turn system prompt, preserving the stable system-prompt cache prefix.
 - Session resume restores the latest persisted style selection, and the active control is re-emitted once after compaction or `/clear`.
+- A request-local context guard preserves the active style when automatic compaction happens after the user-turn hook or during a tool loop, at a stable position across continuations.
+- Extension loading and the `/style` hint poller now use APIs shared by current Pi and OMP.
+- Session-only style and `off` selections are recorded immediately, so navigation or reload before the next prompt cannot discard them.
 
 ## [0.2.1] - 2026-08-08
 

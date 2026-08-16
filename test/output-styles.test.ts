@@ -9,6 +9,7 @@ import outputStyles, {
   restoreSessionSelection,
   shouldInjectStyleControl,
   STYLE_CONTROL_MESSAGE_TYPE,
+  STYLE_SELECTION_ENTRY_TYPE,
   parseStyleCommandArgs,
   bundledStylesDir,
   projectStateFile,
@@ -273,7 +274,6 @@ interface FakeCtx {
     getEditorText: () => string;
     notify: (m: string, t?: string) => void;
   };
-  setInterval: (cb: () => void, ms?: number) => unknown;
   sessionManager: { getBranch: () => Array<Record<string, unknown>> };
 }
 
@@ -297,14 +297,12 @@ function harness(cwd: string): { cap: Captured; ctx: FakeCtx } {
       getEditorText: () => cap.editorText,
       notify: (m, t) => cap.notes.push({ message: m, type: t }),
     },
-    setInterval: cb => {
-      cap.timers.push(cb);
-      return 0;
-    },
     sessionManager: { getBranch: () => cap.entries },
   };
   const pi = {
-    setLabel: () => {},
+    appendEntry: (customType: string, data: unknown) => {
+      cap.entries.push({ type: "custom", customType, data });
+    },
     on: (event: string, handler: (e: unknown, c: FakeCtx) => unknown) => {
       cap.handlers[event] = handler;
     },
@@ -364,6 +362,138 @@ describe("extension wiring", () => {
     cap.entries.push({ id: "style-1", type: "custom_message", ...result.message });
     const repeated = await cap.handlers["before_agent_start"]({ prompt: "again", systemPrompt: ["BASE"] }, ctx);
     expect(repeated).toBeUndefined();
+  });
+
+  test("session selection survives tree navigation before the next prompt", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
+    process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    const { cap, ctx } = harness(cwd);
+    await cap.commands["style"]("teacher", ctx);
+    expect(cap.entries.at(-1)).toMatchObject({ type: "custom", customType: STYLE_SELECTION_ENTRY_TYPE });
+
+    cap.entries.splice(0); // simulate navigating to a branch before the command entry
+    await cap.handlers["session_tree"](undefined, ctx);
+    expect(cap.entries.at(-1)).toMatchObject({ type: "custom", customType: STYLE_SELECTION_ENTRY_TYPE });
+    const result = (await cap.handlers["before_agent_start"](
+      { prompt: "hi", systemPrompt: ["BASE"] },
+      ctx,
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(result.message.content).toContain("Output style: teacher");
+  });
+
+  test("session off survives tree navigation before the next prompt", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
+    process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    writeState(userStateFile(), { active: "teacher" });
+    const { cap, ctx } = harness(cwd);
+    await cap.handlers["session_start"](undefined, ctx);
+    await cap.commands["style"]("off", ctx);
+
+    cap.entries.splice(0); // simulate navigating to a branch before the command entry
+    await cap.handlers["session_tree"](undefined, ctx);
+    const result = (await cap.handlers["before_agent_start"](
+      { prompt: "hi", systemPrompt: ["BASE"] },
+      ctx,
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(result.message.content).toContain("Output style: off");
+  });
+
+  test("context guard restores a style removed by post-hook compaction", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
+    process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    const { cap, ctx } = harness(cwd);
+    await cap.commands["style"]("teacher", ctx);
+    const persisted = (await cap.handlers["before_agent_start"](
+      { prompt: "hi", systemPrompt: ["BASE"] },
+      ctx,
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    cap.entries.push({ id: "style-1", type: "custom_message", ...persisted.message });
+
+    const baseMessages = [
+      { role: "compactionSummary", content: "summary" },
+      { role: "user", content: "hi" },
+    ];
+    const result = (await cap.handlers["context"]({ messages: baseMessages }, ctx)) as {
+      messages: Array<Record<string, unknown>>;
+    };
+    const injected = result.messages[1];
+    expect(injected.role).toBe("custom");
+    expect(injected.customType).toBe(STYLE_CONTROL_MESSAGE_TYPE);
+    expect(injected.content).toContain("Output style: teacher");
+
+    const continuation = (await cap.handlers["context"](
+      {
+        messages: [
+          ...baseMessages,
+          { role: "assistant", content: "working" },
+          { role: "toolResult", content: "done" },
+        ],
+      },
+      ctx,
+    )) as { messages: Array<Record<string, unknown>> };
+    expect(continuation.messages[1]).toEqual(injected);
+    expect(continuation.messages.map(message => message.role)).toEqual([
+      "compactionSummary",
+      "custom",
+      "user",
+      "assistant",
+      "toolResult",
+    ]);
+  });
+
+  test("context guard does not duplicate a current visible control", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
+    process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    const { cap, ctx } = harness(cwd);
+    await cap.commands["style"]("teacher", ctx);
+    const control = buildStyleControlMessage(
+      { type: "style", name: "teacher" },
+      discoverStyles([bundledStylesDir()]).get("teacher")!,
+    );
+    const result = await cap.handlers["context"](
+      { messages: [{ role: "user", content: "hi" }, { role: "custom", ...control, timestamp: 1 }] },
+      ctx,
+    );
+    expect(result).toBeUndefined();
+  });
+
+  test("context guard stays anchored after split-turn compaction removes the user message", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
+    process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    const { cap, ctx } = harness(cwd);
+    await cap.commands["style"]("teacher", ctx);
+    const compacted = [
+      { role: "compactionSummary", content: "summary" },
+      { role: "assistant", content: "working" },
+      { role: "toolResult", content: "one" },
+    ];
+
+    const first = (await cap.handlers["context"]({ messages: compacted }, ctx)) as {
+      messages: Array<Record<string, unknown>>;
+    };
+    const second = (await cap.handlers["context"](
+      { messages: [...compacted, { role: "assistant", content: "still working" }, { role: "toolResult", content: "two" }] },
+      ctx,
+    )) as { messages: Array<Record<string, unknown>> };
+
+    expect(first.messages[1]).toEqual(second.messages[1]);
+    expect(first.messages[1].customType).toBe(STYLE_CONTROL_MESSAGE_TYPE);
+    expect(second.messages.map(message => message.role)).toEqual([
+      "compactionSummary",
+      "custom",
+      "assistant",
+      "toolResult",
+      "assistant",
+      "toolResult",
+    ]);
+  });
+
+  test("context guard is inert when no style has ever been active", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
+    process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    const { cap, ctx } = harness(cwd);
+    const result = await cap.handlers["context"]({ messages: [{ role: "user", content: "hi" }] }, ctx);
+    expect(result).toBeUndefined();
   });
 
   test("/style teacher --project persists to the project state file", async () => {
@@ -668,7 +798,11 @@ describe("startHintPoller", () => {
     const cwd = mkdtempSync(join(tmpdir(), "pos-poll-"));
     process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-poll-home-"));
     const { cap, ctx } = harness(cwd);
-    startHintPoller(ctx);
+    const schedule = ((callback: () => void) => {
+      cap.timers.push(callback);
+      return { unref() {} };
+    }) as NonNullable<Parameters<typeof startHintPoller>[1]>;
+    const stop = startHintPoller(ctx, schedule, () => {});
     expect(cap.timers).toHaveLength(1);
 
     cap.editorText = "/style concise";
@@ -688,5 +822,6 @@ describe("startHintPoller", () => {
     cap.timers[0]();
     expect(cap.widgets).toHaveLength(2);
     expect(cap.widgets[1].lines).toBeNull();
+    stop();
   });
 });
