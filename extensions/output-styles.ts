@@ -4,6 +4,7 @@
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { clearInterval as clearNodeInterval, setInterval as setNodeInterval } from "node:timers";
 import { fileURLToPath } from "node:url";
 
 export interface Style {
@@ -28,7 +29,6 @@ interface ExtensionContext {
   sessionManager: {
     getBranch(): SessionEntryLike[];
   };
-  setInterval(callback: () => void, ms?: number): unknown;
 }
 
 interface BeforeAgentStartEvent {
@@ -38,6 +38,23 @@ interface BeforeAgentStartEvent {
 
 interface BeforeAgentStartResult {
   message?: StyleControlMessage;
+}
+
+interface AgentMessageLike {
+  role: string;
+  customType?: string;
+  content?: unknown;
+  display?: boolean;
+  details?: unknown;
+  timestamp?: number;
+}
+
+interface ContextEvent {
+  messages: AgentMessageLike[];
+}
+
+interface ContextResult {
+  messages?: AgentMessageLike[];
 }
 
 interface AutocompleteItem {
@@ -50,12 +67,13 @@ interface AutocompleteItem {
 type EventHandler<E, R = void> = (event: E, ctx: ExtensionContext) => R | void | Promise<R | void>;
 
 interface ExtensionAPI {
-  setLabel(label: string): void;
+  appendEntry(customType: string, data: unknown): void;
   on(
     event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "session_shutdown",
     handler: EventHandler<unknown>,
   ): void;
   on(event: "before_agent_start", handler: EventHandler<BeforeAgentStartEvent, BeforeAgentStartResult>): void;
+  on(event: "context", handler: EventHandler<ContextEvent, ContextResult>): void;
   registerCommand(
     name: string,
     def: {
@@ -171,6 +189,7 @@ export interface SessionEntryLike {
   customType?: string;
   content?: unknown;
   details?: unknown;
+  data?: unknown;
 }
 
 interface StyleControlDetails {
@@ -187,6 +206,7 @@ export interface StyleControlMessage {
 }
 
 export const STYLE_CONTROL_MESSAGE_TYPE = "pi-output-style-control";
+export const STYLE_SELECTION_ENTRY_TYPE = "pi-output-style-selection";
 
 function copySelection(selection: SessionSelection): SessionSelection {
   return selection.type === "style" ? { type: "style", name: selection.name } : { type: selection.type };
@@ -228,8 +248,12 @@ export function buildStyleControlMessage(selection: SessionSelection, style: Sty
 export function restoreSessionSelection(entries: readonly SessionEntryLike[]): SessionSelection {
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
-    if (!isStyleControlEntry(entry)) continue;
-    const selection = selectionFromDetails(entry.details);
+    const selection =
+      entry.type === "custom" && entry.customType === STYLE_SELECTION_ENTRY_TYPE
+        ? selectionFromDetails(entry.data)
+        : isStyleControlEntry(entry)
+          ? selectionFromDetails(entry.details)
+          : null;
     if (selection) return selection;
   }
   return { type: "inherit" };
@@ -314,12 +338,21 @@ export function styleHintFor(text: string): string[] | null {
 // hint was computed for.
 let started = false;
 let lastHintInput: string | null = null;
+let stopHintPoller: (() => void) | null = null;
+
+type IntervalHandle = ReturnType<typeof setNodeInterval>;
+type IntervalScheduler = (callback: () => void, ms: number) => IntervalHandle;
+type IntervalCanceller = (handle: IntervalHandle) => void;
 
 // Debounced poller: only updates the widget once the input text is stable
 // across a tick and differs from the last-checked text. Exported for tests.
-export function startHintPoller(ctx: ExtensionContext): void {
+export function startHintPoller(
+  ctx: ExtensionContext,
+  schedule: IntervalScheduler = setNodeInterval,
+  cancel: IntervalCanceller = clearNodeInterval,
+): () => void {
   let stableInput: string | null = null;
-  ctx.setInterval(() => {
+  const handle = schedule(() => {
     const text = ctx.ui.getEditorText();
     if (text !== stableInput) {
       stableInput = text;
@@ -334,6 +367,8 @@ export function startHintPoller(ctx: ExtensionContext): void {
       lastHintInput = null;
     }
   }, 600);
+  handle.unref?.();
+  return () => cancel(handle);
 }
 
 function styleDirs(cwd: string): string[] {
@@ -387,11 +422,25 @@ function refreshStatus(ctx: ExtensionContext, style: Style | null): void {
 }
 
 export default function outputStyles(pi: ExtensionAPI): void {
-  pi.setLabel("output-styles");
   let session: SessionSelection = { type: "inherit" };
+  let contextControlKey = "";
+  let contextControlTimestamp = Date.now();
 
   const restoreSession = (ctx: ExtensionContext): void => {
     session = restoreSessionSelection(ctx.sessionManager.getBranch());
+    refreshStatus(ctx, resolveActiveStyle(ctx.cwd, undefined, session));
+  };
+
+  const recordSessionSelection = (): void => {
+    pi.appendEntry(STYLE_SELECTION_ENTRY_TYPE, { version: 1, selection: copySelection(session) });
+  };
+
+  const preserveSessionSelectionAfterNavigation = (ctx: ExtensionContext): void => {
+    if (session.type === "inherit") {
+      restoreSession(ctx);
+      return;
+    }
+    if (!sameSelection(restoreSessionSelection(ctx.sessionManager.getBranch()), session)) recordSessionSelection();
     refreshStatus(ctx, resolveActiveStyle(ctx.cwd, undefined, session));
   };
 
@@ -399,13 +448,15 @@ export default function outputStyles(pi: ExtensionAPI): void {
     restoreSession(ctx);
     if (started || !ctx.hasUI) return;
     started = true;
-    startHintPoller(ctx);
+    stopHintPoller = startHintPoller(ctx);
   });
 
   pi.on("session_switch", (_event, ctx) => restoreSession(ctx));
-  pi.on("session_branch", (_event, ctx) => restoreSession(ctx));
-  pi.on("session_tree", (_event, ctx) => restoreSession(ctx));
+  pi.on("session_branch", (_event, ctx) => preserveSessionSelectionAfterNavigation(ctx));
+  pi.on("session_tree", (_event, ctx) => preserveSessionSelectionAfterNavigation(ctx));
   pi.on("session_shutdown", () => {
+    stopHintPoller?.();
+    stopHintPoller = null;
     started = false;
     lastHintInput = null;
   });
@@ -427,6 +478,47 @@ export default function outputStyles(pi: ExtensionAPI): void {
       return { message };
     } catch {
       return; // never fail a turn over a styling concern
+    }
+  });
+
+  // `context` runs after automatic compaction and before every provider call,
+  // including tool-loop continuations. If compaction removed the persisted
+  // control after `before_agent_start`, add one request-local copy so the style
+  // never disappears for that call. The next user turn persists it normally.
+  pi.on("context", (event, ctx) => {
+    try {
+      const entries = ctx.sessionManager.getBranch();
+      const style = resolveActiveStyle(ctx.cwd, undefined, session);
+      if (!style && session.type === "inherit" && !hasStyleControl(entries)) return;
+      const control = buildStyleControlMessage(session, style);
+      const contextEntries: SessionEntryLike[] = event.messages.map(message => ({
+        type: message.role === "custom" ? "custom_message" : message.role,
+        customType: message.customType,
+        content: message.content,
+        details: message.details,
+      }));
+      if (!shouldInjectStyleControl(contextEntries, control)) return;
+      const key = `${control.content}\n${JSON.stringify(control.details.selection)}`;
+      if (key !== contextControlKey) {
+        contextControlKey = key;
+        contextControlTimestamp = Date.now();
+      }
+      const message = { role: "custom", ...control, timestamp: contextControlTimestamp };
+      // Insert before the current user turn rather than at the tail. The same
+      // position survives later assistant/tool-result appends, so tool-loop
+      // continuations retain a stable provider-cache prefix.
+      const currentUser = event.messages.findLastIndex(item => item.role === "user");
+      const compactionSummary = event.messages.findLastIndex(item => item.role === "compactionSummary");
+      const insertionIndex = currentUser >= 0 ? currentUser : compactionSummary >= 0 ? compactionSummary + 1 : 0;
+      return {
+        messages: [
+          ...event.messages.slice(0, insertionIndex),
+          message,
+          ...event.messages.slice(insertionIndex),
+        ],
+      };
+    } catch {
+      return;
     }
   });
 
@@ -457,6 +549,7 @@ export default function outputStyles(pi: ExtensionAPI): void {
       }
       if (OFF_WORDS[name.toLowerCase()]) {
         session = { type: "off" };
+        recordSessionSelection();
         let offScope = "this session";
         try {
           if (persist === "user") {
@@ -479,6 +572,7 @@ export default function outputStyles(pi: ExtensionAPI): void {
       }
 
       session = { type: "style", name };
+      recordSessionSelection();
       let scope = "this session";
       try {
         if (persist === "user") {

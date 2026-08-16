@@ -28,7 +28,7 @@ Install this fork from GitHub; the upstream npm release does not include the cac
 
 The effective system prompt is left unchanged. When a style becomes active, changes, or turns off, the extension adds a hidden model-visible control message after the submitted prompt. OMP/Pi persists that message in session history, so an unchanged style body is not repeated every turn. Later switches append a superseding control and preserve the existing provider-cache prefix.
 
-Session resume restores the latest persisted session selection. After compaction or `/clear`, the extension re-emits the current control once; this covers locally kept history, provider-owned remote compaction, and explicit context resets without repeating the body every turn. The status line shows the active style.
+The session selection is recorded immediately, so switching sessions or navigating the tree before the next prompt does not discard a confirmed `/style` change. Session resume restores that selection. After compaction or `/clear`, the extension re-emits the current control once; a final pre-provider context guard also covers automatic compaction and tool-loop continuations that happen after the user-turn hook. The guard keeps a stable position across continuations, preserving locally kept history, provider-owned remote compaction, explicit context resets, and the provider-cache prefix without repeating the body on ordinary turns. The status line shows the active style.
 
 ## Bundled styles
 
