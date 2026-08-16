@@ -1,4 +1,4 @@
-// pi-output-styles — named, append-only system-prompt styles for OMP/Pi.
+// pi-output-styles — named, cache-preserving output styles for OMP/Pi.
 // Pure helpers are exported for unit testing.
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -25,6 +25,9 @@ interface ExtensionContext {
   cwd: string;
   hasUI: boolean;
   ui: ExtensionUI;
+  sessionManager: {
+    getBranch(): SessionEntryLike[];
+  };
   setInterval(callback: () => void, ms?: number): unknown;
 }
 
@@ -34,7 +37,7 @@ interface BeforeAgentStartEvent {
 }
 
 interface BeforeAgentStartResult {
-  systemPrompt?: string[];
+  message?: StyleControlMessage;
 }
 
 interface AutocompleteItem {
@@ -48,8 +51,10 @@ type EventHandler<E, R = void> = (event: E, ctx: ExtensionContext) => R | void |
 
 interface ExtensionAPI {
   setLabel(label: string): void;
-  on(event: "session_start", handler: EventHandler<unknown>): void;
-  on(event: "session_shutdown", handler: EventHandler<unknown>): void;
+  on(
+    event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "session_shutdown",
+    handler: EventHandler<unknown>,
+  ): void;
   on(event: "before_agent_start", handler: EventHandler<BeforeAgentStartEvent, BeforeAgentStartResult>): void;
   registerCommand(
     name: string,
@@ -158,12 +163,105 @@ export function resolveActiveName(
   return sessionActive ?? userState.active ?? projectState.active ?? null;
 }
 
-const MARKER_PREFIX = "<!-- pi-output-styles:";
+export type SessionSelection = { type: "inherit" } | { type: "off" } | { type: "style"; name: string };
 
-export function applyStyle(baseBlocks: string[] | undefined, style: Style): string[] {
-  const base = Array.isArray(baseBlocks) ? baseBlocks : [];
-  if (base.some(b => b.includes(MARKER_PREFIX))) return base;
-  return [...base, `${MARKER_PREFIX}${style.name} -->\n${style.body}`];
+export interface SessionEntryLike {
+  id?: string;
+  type: string;
+  customType?: string;
+  content?: unknown;
+  details?: unknown;
+}
+
+interface StyleControlDetails {
+  version: 1;
+  selection: SessionSelection;
+  activeStyle: string | null;
+}
+
+export interface StyleControlMessage {
+  customType: string;
+  content: string;
+  display: false;
+  details: StyleControlDetails;
+}
+
+export const STYLE_CONTROL_MESSAGE_TYPE = "pi-output-style-control";
+
+function copySelection(selection: SessionSelection): SessionSelection {
+  return selection.type === "style" ? { type: "style", name: selection.name } : { type: selection.type };
+}
+
+function selectionFromDetails(details: unknown): SessionSelection | null {
+  if (!details || typeof details !== "object" || !("version" in details) || details.version !== 1) return null;
+  if (!("selection" in details) || !details.selection || typeof details.selection !== "object") return null;
+  const selection = details.selection;
+  if (!("type" in selection) || typeof selection.type !== "string") return null;
+  if (selection.type === "inherit" || selection.type === "off") return { type: selection.type };
+  if (selection.type === "style" && "name" in selection && typeof selection.name === "string") {
+    return { type: "style", name: selection.name };
+  }
+  return null;
+}
+
+function sameSelection(left: SessionSelection | null, right: SessionSelection): boolean {
+  if (!left || left.type !== right.type) return false;
+  return left.type !== "style" || (right.type === "style" && left.name === right.name);
+}
+
+function isStyleControlEntry(entry: SessionEntryLike): boolean {
+  return entry.type === "custom_message" && entry.customType === STYLE_CONTROL_MESSAGE_TYPE;
+}
+
+export function buildStyleControlMessage(selection: SessionSelection, style: Style | null): StyleControlMessage {
+  const content = style
+    ? `[pi-output-styles control]\nOutput style: ${style.name}\nThis control supersedes earlier pi-output-styles controls. Apply these instructions to subsequent responses until another pi-output-styles control appears:\n\n${style.body}`
+    : "[pi-output-styles control]\nOutput style: off\nThis control supersedes earlier pi-output-styles controls. Do not apply instructions from earlier pi-output-styles control messages.";
+  return {
+    customType: STYLE_CONTROL_MESSAGE_TYPE,
+    content,
+    display: false,
+    details: { version: 1, selection: copySelection(selection), activeStyle: style?.name ?? null },
+  };
+}
+
+export function restoreSessionSelection(entries: readonly SessionEntryLike[]): SessionSelection {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (!isStyleControlEntry(entry)) continue;
+    const selection = selectionFromDetails(entry.details);
+    if (selection) return selection;
+  }
+  return { type: "inherit" };
+}
+
+// Compaction and /clear reset the provider-visible context. Always require a
+// control after the latest such boundary: local compaction may retain selected
+// entries, while remote compaction can replace them with provider-owned
+// history. Looking only after the boundary is correct for all paths and costs
+// one style body per reset rather than one per turn.
+function firstVisibleEntryIndex(entries: readonly SessionEntryLike[]): number {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].type === "compaction" || entries[i].type === "reset_boundary") return i + 1;
+  }
+  return 0;
+}
+
+export function shouldInjectStyleControl(
+  entries: readonly SessionEntryLike[],
+  message: StyleControlMessage,
+): boolean {
+  const firstVisible = firstVisibleEntryIndex(entries);
+  for (let i = entries.length - 1; i >= firstVisible; i--) {
+    const entry = entries[i];
+    if (!isStyleControlEntry(entry)) continue;
+    return entry.content !== message.content || !sameSelection(selectionFromDetails(entry.details), message.details.selection);
+  }
+  return true;
+}
+
+function hasStyleControl(entries: readonly SessionEntryLike[]): boolean {
+  return entries.some(isStyleControlEntry);
 }
 
 export type PersistScope = "none" | "user" | "project";
@@ -238,14 +336,6 @@ export function startHintPoller(ctx: ExtensionContext): void {
   }, 600);
 }
 
-// Session-active style selection is process-global (module-level) state.
-// This assumes one module instance per session/cwd, which holds under
-// today's per-session extension loading. If OMP ever shares one module
-// instance across multiple concurrent sessions, switch this to a
-// cwd-keyed Map instead of a single variable.
-type SessionSelection = { type: "inherit" } | { type: "off" } | { type: "style"; name: string };
-let session: SessionSelection = { type: "inherit" };
-
 function styleDirs(cwd: string): string[] {
   // low → high precedence: bundled < user < project
   return [bundledStylesDir(), userStylesDir(), projectStylesDir(cwd)];
@@ -275,9 +365,13 @@ export function styleCompletions(argumentPrefix: string, cwd: string): Autocompl
   return items.length > 0 ? items : null;
 }
 
-export function resolveActiveStyle(cwd: string, styles?: Map<string, Style>): Style | null {
-  if (session.type === "off") return null;
-  const sessionActive = session.type === "style" ? session.name : null;
+export function resolveActiveStyle(
+  cwd: string,
+  styles?: Map<string, Style>,
+  selection: SessionSelection = { type: "inherit" },
+): Style | null {
+  if (selection.type === "off") return null;
+  const sessionActive = selection.type === "style" ? selection.name : null;
   const name = resolveActiveName(
     sessionActive,
     readState(userStateFile()),
@@ -294,38 +388,50 @@ function refreshStatus(ctx: ExtensionContext, style: Style | null): void {
 
 export default function outputStyles(pi: ExtensionAPI): void {
   pi.setLabel("output-styles");
+  let session: SessionSelection = { type: "inherit" };
+
+  const restoreSession = (ctx: ExtensionContext): void => {
+    session = restoreSessionSelection(ctx.sessionManager.getBranch());
+    refreshStatus(ctx, resolveActiveStyle(ctx.cwd, undefined, session));
+  };
 
   pi.on("session_start", (_event, ctx) => {
-    refreshStatus(ctx, resolveActiveStyle(ctx.cwd));
+    restoreSession(ctx);
     if (started || !ctx.hasUI) return;
     started = true;
     startHintPoller(ctx);
-    pi.on("session_shutdown", () => {
-      started = false;
-      lastHintInput = null;
-    });
   });
 
-  pi.on("before_agent_start", (event, ctx) => {
+  pi.on("session_switch", (_event, ctx) => restoreSession(ctx));
+  pi.on("session_branch", (_event, ctx) => restoreSession(ctx));
+  pi.on("session_tree", (_event, ctx) => restoreSession(ctx));
+  pi.on("session_shutdown", () => {
+    started = false;
+    lastHintInput = null;
+  });
+
+  pi.on("before_agent_start", (_event, ctx) => {
     try {
-      const style = resolveActiveStyle(ctx.cwd);
-      if (!style) {
+      const entries = ctx.sessionManager.getBranch();
+      const style = resolveActiveStyle(ctx.cwd, undefined, session);
+      if (!style && session.type === "inherit" && !hasStyleControl(entries)) {
         refreshStatus(ctx, null);
         return;
       }
-      // Apply first; only reflect the style in the status line once the
-      // prompt was actually augmented, so a swallowed throw never advertises
-      // a style the turn did not apply.
-      const result = { systemPrompt: applyStyle(event.systemPrompt, style) };
+      const message = buildStyleControlMessage(session, style);
       refreshStatus(ctx, style);
-      return result;
+      // before_agent_start custom messages are appended after the submitted
+      // prompt, converted to provider-visible developer context, and persisted
+      // by OMP/Pi. Reuse that history entry until a real transition occurs.
+      if (!shouldInjectStyleControl(entries, message)) return;
+      return { message };
     } catch {
       return; // never fail a turn over a styling concern
     }
   });
 
   pi.registerCommand("style", {
-    description: "Select an append-only output style, or clear it. Usage: /style [name|off] [--save] [--project]",
+    description: "Select a cache-preserving output style, or clear it. Usage: /style [name|off] [--save] [--project]",
     getArgumentCompletions: argumentPrefix => styleCompletions(argumentPrefix, process.cwd()),
     handler: (args, ctx) => {
       const { name, persist } = parseStyleCommandArgs(args);
@@ -341,7 +447,7 @@ export default function outputStyles(pi: ExtensionAPI): void {
       }
 
       if (!name) {
-        const current = resolveActiveStyle(ctx.cwd, styles);
+        const current = resolveActiveStyle(ctx.cwd, styles, session);
         const listing = [...styles.values()]
           .sort((a, b) => a.name.localeCompare(b.name))
           .map(s => (s.description ? `${s.name} — ${s.description}` : s.name))

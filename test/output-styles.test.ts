@@ -5,7 +5,10 @@ import outputStyles, {
   readState,
   writeState,
   resolveActiveName,
-  applyStyle,
+  buildStyleControlMessage,
+  restoreSessionSelection,
+  shouldInjectStyleControl,
+  STYLE_CONTROL_MESSAGE_TYPE,
   parseStyleCommandArgs,
   bundledStylesDir,
   projectStateFile,
@@ -13,7 +16,6 @@ import outputStyles, {
   styleCompletions,
   styleHintFor,
   startHintPoller,
-  resolveActiveStyle,
 } from "../extensions/output-styles.ts";
 
 describe("parseStyle", () => {
@@ -143,36 +145,65 @@ describe("resolveActiveName", () => {
   });
 });
 
-describe("applyStyle", () => {
+describe("style control messages", () => {
   const style = { name: "teacher", description: "", body: "Teach clearly." };
 
-  test("appends exactly one marked block preserving base order", () => {
-    const out = applyStyle(["A", "B"], style);
-    expect(out.length).toBe(3);
-    expect(out.slice(0, 2)).toEqual(["A", "B"]);
-    expect(out[2]).toBe("<!-- pi-output-styles:teacher -->\nTeach clearly.");
+  test("builds a hidden model-visible control message without a system-prompt field", () => {
+    const message = buildStyleControlMessage({ type: "style", name: "teacher" }, style);
+    expect(message.customType).toBe(STYLE_CONTROL_MESSAGE_TYPE);
+    expect(message.display).toBe(false);
+    expect(message.content).toContain("Teach clearly.");
+    expect(message.content).toContain("supersedes earlier pi-output-styles controls");
+    expect(message).not.toHaveProperty("systemPrompt");
   });
 
-  test("coerces undefined base to empty array", () => {
-    const out = applyStyle(undefined, style);
-    expect(out).toEqual(["<!-- pi-output-styles:teacher -->\nTeach clearly."]);
+  test("builds an off control that revokes earlier style messages", () => {
+    const message = buildStyleControlMessage({ type: "off" }, null);
+    expect(message.content).toContain("Output style: off");
+    expect(message.content).toContain("Do not apply instructions from earlier pi-output-styles control messages");
   });
 
-  test("is idempotent when a marker block is already present", () => {
-    const once = applyStyle(["BASE"], style);
-    const twice = applyStyle(once, style);
-    expect(twice).toEqual(once);
+  test("restores an explicit session selection from persisted control metadata", () => {
+    const message = buildStyleControlMessage({ type: "style", name: "teacher" }, style);
+    expect(
+      restoreSessionSelection([
+        { id: "1", type: "custom_message", ...message },
+      ]),
+    ).toEqual({ type: "style", name: "teacher" });
   });
 
-  test("does not append a second block when switching styles mid-prompt", () => {
-    const other = { name: "concise", description: "", body: "Be brief." };
-    const once = applyStyle(["BASE"], style);
-    expect(applyStyle(once, other)).toEqual(once);
+  test("does not repeat an unchanged control that remains visible in history", () => {
+    const message = buildStyleControlMessage({ type: "style", name: "teacher" }, style);
+    const entries = [{ id: "1", type: "custom_message", ...message }];
+    expect(shouldInjectStyleControl(entries, message)).toBe(false);
   });
 
-  test("coerces a non-array base to empty", () => {
-    // @ts-expect-error — exercising the runtime Array.isArray guard against a non-array
-    expect(applyStyle(null, style)).toEqual(["<!-- pi-output-styles:teacher -->\nTeach clearly."]);
+  test("re-emits a control summarized away by compaction", () => {
+    const message = buildStyleControlMessage({ type: "style", name: "teacher" }, style);
+    const entries = [
+      { id: "style", type: "custom_message", ...message },
+      { id: "kept", type: "message" },
+      { id: "compact", type: "compaction", firstKeptEntryId: "kept" },
+    ];
+    expect(shouldInjectStyleControl(entries, message)).toBe(true);
+  });
+
+  test("re-emits after compaction even when a local kept range contains the old control", () => {
+    const message = buildStyleControlMessage({ type: "style", name: "teacher" }, style);
+    const entries = [
+      { id: "style", type: "custom_message", ...message },
+      { id: "compact", type: "compaction", firstKeptEntryId: "style" },
+    ];
+    expect(shouldInjectStyleControl(entries, message)).toBe(true);
+  });
+
+  test("re-emits after /clear removes the old control from provider-visible context", () => {
+    const message = buildStyleControlMessage({ type: "style", name: "teacher" }, style);
+    const entries = [
+      { id: "style", type: "custom_message", ...message },
+      { id: "clear", type: "reset_boundary" },
+    ];
+    expect(shouldInjectStyleControl(entries, message)).toBe(true);
   });
 });
 
@@ -231,6 +262,7 @@ interface Captured {
   widgets: { key: string; lines: string[] | null }[];
   timers: (() => void)[];
   editorText: string;
+  entries: Array<Record<string, unknown>>;
 }
 interface FakeCtx {
   cwd: string;
@@ -242,10 +274,20 @@ interface FakeCtx {
     notify: (m: string, t?: string) => void;
   };
   setInterval: (cb: () => void, ms?: number) => unknown;
+  sessionManager: { getBranch: () => Array<Record<string, unknown>> };
 }
 
 function harness(cwd: string): { cap: Captured; ctx: FakeCtx } {
-  const cap: Captured = { commands: {}, handlers: {}, statuses: [], notes: [], widgets: [], timers: [], editorText: "" };
+  const cap: Captured = {
+    commands: {},
+    handlers: {},
+    statuses: [],
+    notes: [],
+    widgets: [],
+    timers: [],
+    editorText: "",
+    entries: [],
+  };
   const ctx: FakeCtx = {
     cwd,
     hasUI: true,
@@ -259,6 +301,7 @@ function harness(cwd: string): { cap: Captured; ctx: FakeCtx } {
       cap.timers.push(cb);
       return 0;
     },
+    sessionManager: { getBranch: () => cap.entries },
   };
   const pi = {
     setLabel: () => {},
@@ -278,22 +321,16 @@ function harness(cwd: string): { cap: Captured; ctx: FakeCtx } {
 }
 
 describe("extension wiring", () => {
-  test("no active style → before_agent_start leaves the prompt unchanged", async () => {
+  test("no active style → before_agent_start leaves the system prompt unchanged", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
     process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
     const { cap, ctx } = harness(cwd);
-    const result = await cap.handlers["before_agent_start"]({ prompt: "hi", systemPrompt: ["BASE"] }, ctx);
+    const event = { prompt: "hi", systemPrompt: ["BASE"] };
+    const result = await cap.handlers["before_agent_start"](event, ctx);
     expect(result).toBeUndefined();
+    expect(event.systemPrompt).toEqual(["BASE"]);
   });
 
-  // NOTE: order deliberately deviates from the brief's literal listing.
-  // `sessionActive` is module-level and persists across tests in this file;
-  // "teacher" is a bundled style discoverable from any cwd, so running the
-  // teacher-session test before this one would leave sessionActive="teacher"
-  // and make this test's "no prompt change" expectation false. The brief's
-  // own note permits reordering as long as "no active style" stays first:
-  // "If you reorder tests, keep the 'no active' case first ...". This test
-  // runs while sessionActive is still unset by any prior /style call.
   test("/style unknown → error notice and no prompt change", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
     process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
@@ -304,22 +341,29 @@ describe("extension wiring", () => {
     expect(result).toBeUndefined();
   });
 
-  test("/style teacher (session) → hook appends the teacher block", async () => {
+  test("/style teacher (session) → hook returns a trailing control message without replacing the system prompt", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
     process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
     const { cap, ctx } = harness(cwd);
     await cap.commands["style"]("teacher", ctx);
+    const event = { prompt: "hi", systemPrompt: ["BASE"] };
     const result = (await cap.handlers["before_agent_start"](
-      { prompt: "hi", systemPrompt: ["BASE"] },
+      event,
       ctx,
-    )) as { systemPrompt: string[] };
-    expect(result.systemPrompt[0]).toBe("BASE");
-    expect(result.systemPrompt[1]).toContain("<!-- pi-output-styles:teacher -->");
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(result.message.customType).toBe(STYLE_CONTROL_MESSAGE_TYPE);
+    expect(result.message.content).toContain("Output style: teacher");
+    expect(result).not.toHaveProperty("systemPrompt");
+    expect(event.systemPrompt).toEqual(["BASE"]);
     expect(cap.notes.some(n => n.type === "info")).toBe(true);
     // Personal-by-default: a bare /style (no --save/--project flag) must not
-    // persist anything to disk — only sessionActive (in-memory) changes.
+    // persist config to disk. OMP persists the hidden control in session history.
     expect(readState(projectStateFile(cwd))).toEqual({});
     expect(readState(userStateFile())).toEqual({});
+
+    cap.entries.push({ id: "style-1", type: "custom_message", ...result.message });
+    const repeated = await cap.handlers["before_agent_start"]({ prompt: "again", systemPrompt: ["BASE"] }, ctx);
+    expect(repeated).toBeUndefined();
   });
 
   test("/style teacher --project persists to the project state file", async () => {
@@ -340,15 +384,18 @@ describe("extension wiring", () => {
     expect(readState(projectStateFile(cwd))).toEqual({});
   });
 
-  // sessionActive is "teacher" here (set by the session-scope test above),
-  // and each harness() call below builds a fresh `cap`, so these tests
-  // observe only their own captured statuses/notes.
-  test("session_start sets the status line", async () => {
+  test("session_start resolves a saved default and sets the status line", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
     process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    writeState(userStateFile(), { active: "teacher" });
     const { cap, ctx } = harness(cwd);
     await cap.handlers["session_start"](undefined, ctx);
     expect(cap.statuses).toContain("style: teacher");
+    const result = (await cap.handlers["before_agent_start"](
+      { prompt: "hi", systemPrompt: ["BASE"] },
+      ctx,
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(result.message.content).toContain("Output style: teacher");
   });
 
   test("hasUI:false suppresses status", async () => {
@@ -368,15 +415,34 @@ describe("extension wiring", () => {
     const first = (await cap.handlers["before_agent_start"](
       { prompt: "hi", systemPrompt: ["BASE"] },
       ctx,
-    )) as { systemPrompt: string[] };
-    expect(first.systemPrompt[1]).toContain("<!-- pi-output-styles:teacher -->");
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(first.message.content).toContain("Output style: teacher");
+    cap.entries.push({ id: "style-1", type: "custom_message", ...first.message });
 
     await cap.commands["style"]("nope-not-real", ctx);
-    const second = (await cap.handlers["before_agent_start"](
-      { prompt: "hi", systemPrompt: ["BASE"] },
+    const second = await cap.handlers["before_agent_start"]({ prompt: "hi", systemPrompt: ["BASE"] }, ctx);
+    expect(second).toBeUndefined();
+  });
+
+  test("switching styles appends only the new style control", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
+    process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    const { cap, ctx } = harness(cwd);
+    await cap.commands["style"]("teacher", ctx);
+    const teacher = (await cap.handlers["before_agent_start"](
+      { prompt: "one", systemPrompt: ["BASE"] },
       ctx,
-    )) as { systemPrompt: string[] };
-    expect(second.systemPrompt[1]).toContain("<!-- pi-output-styles:teacher -->");
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    cap.entries.push({ id: "style-1", type: "custom_message", ...teacher.message });
+
+    await cap.commands["style"]("concise", ctx);
+    const concise = (await cap.handlers["before_agent_start"](
+      { prompt: "two", systemPrompt: ["BASE"] },
+      ctx,
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(concise.message.content).toContain("Output style: concise");
+    expect(concise.message.content).not.toContain("Act as a patient teacher");
+    expect(concise).not.toHaveProperty("systemPrompt");
   });
 
   test("/style teacher resolves the project-local definition over the bundled one", async () => {
@@ -392,18 +458,21 @@ describe("extension wiring", () => {
     const result = (await cap.handlers["before_agent_start"](
       { prompt: "hi", systemPrompt: ["BASE"] },
       ctx,
-    )) as { systemPrompt: string[] };
-    expect(result.systemPrompt[1]).toContain("PROJECT-OVERRIDE-BODY");
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(result.message.content).toContain("PROJECT-OVERRIDE-BODY");
   });
 
-  test("before_agent_start never throws even if applyStyle would (malformed base)", async () => {
+  test("before_agent_start ignores malformed system-prompt input instead of touching it", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
     process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
     const { cap, ctx } = harness(cwd);
     await cap.commands["style"]("teacher", ctx);
     const malformedEvent = { prompt: "hi", systemPrompt: ["ok", 42] };
-    const result = await cap.handlers["before_agent_start"](malformedEvent, ctx);
-    expect(result).toBeUndefined();
+    const result = (await cap.handlers["before_agent_start"](malformedEvent, ctx)) as {
+      message: ReturnType<typeof buildStyleControlMessage>;
+    };
+    expect(result.message.content).toContain("Output style: teacher");
+    expect(malformedEvent.systemPrompt).toEqual(["ok", 42]);
   });
 
   test("/style teacher --project notifies a warning and does not throw when saving fails", async () => {
@@ -424,8 +493,8 @@ describe("extension wiring", () => {
     const result = (await cap.handlers["before_agent_start"](
       { prompt: "hi", systemPrompt: ["BASE"] },
       ctx,
-    )) as { systemPrompt: string[] };
-    expect(result.systemPrompt[1]).toContain("<!-- pi-output-styles:teacher -->");
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(result.message.content).toContain("Output style: teacher");
   });
 
   test("/style (no args) lists styles with their descriptions", async () => {
@@ -443,9 +512,12 @@ describe("extension wiring", () => {
     const { cap, ctx } = harness(cwd);
     writeState(userStateFile(), { active: "teacher" }); // a saved default exists
     await cap.commands["style"]("teacher", ctx);
-    expect(resolveActiveStyle(cwd)?.name).toBe("teacher");
     await cap.commands["style"]("off", ctx);
-    expect(resolveActiveStyle(cwd)).toBeNull();
+    const result = (await cap.handlers["before_agent_start"](
+      { prompt: "hi", systemPrompt: ["BASE"] },
+      ctx,
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(result.message.content).toContain("Output style: off");
     expect(cap.notes.some(n => n.type === "info" && n.message.toLowerCase().includes("off"))).toBe(true);
   });
 
@@ -455,7 +527,59 @@ describe("extension wiring", () => {
     const { cap, ctx } = harness(cwd);
     writeState(userStateFile(), { active: "teacher" });
     await cap.commands["style"]("none", ctx);
-    expect(resolveActiveStyle(cwd)).toBeNull();
+    const result = (await cap.handlers["before_agent_start"](
+      { prompt: "hi", systemPrompt: ["BASE"] },
+      ctx,
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(result.message.content).toContain("Output style: off");
+  });
+
+  test("resume restores the session selection and does not repeat a visible style body", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
+    process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    const style = discoverStyles([bundledStylesDir()]).get("teacher")!;
+    const persisted = buildStyleControlMessage({ type: "style", name: "teacher" }, style);
+    const { cap, ctx } = harness(cwd);
+    cap.entries.push({ id: "style-1", type: "custom_message", ...persisted });
+
+    await cap.handlers["session_switch"]({ reason: "resume" }, ctx);
+    const result = await cap.handlers["before_agent_start"]({ prompt: "hi", systemPrompt: ["BASE"] }, ctx);
+    expect(result).toBeUndefined();
+    expect(cap.statuses).toContain("style: teacher");
+  });
+
+  test("resume preserves an explicit off selection over a saved default", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
+    process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    writeState(userStateFile(), { active: "teacher" });
+    const persisted = buildStyleControlMessage({ type: "off" }, null);
+    const { cap, ctx } = harness(cwd);
+    cap.entries.push({ id: "style-off", type: "custom_message", ...persisted });
+
+    await cap.handlers["session_switch"]({ reason: "resume" }, ctx);
+    const result = await cap.handlers["before_agent_start"]({ prompt: "hi", systemPrompt: ["BASE"] }, ctx);
+    expect(result).toBeUndefined();
+    expect(cap.statuses.at(-1)).toBeUndefined();
+  });
+
+  test("resume re-emits a session style when compaction removed its control from live context", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pos-wire-"));
+    process.env.PI_OUTPUT_STYLES_HOME = mkdtempSync(join(tmpdir(), "pos-home-"));
+    const style = discoverStyles([bundledStylesDir()]).get("teacher")!;
+    const persisted = buildStyleControlMessage({ type: "style", name: "teacher" }, style);
+    const { cap, ctx } = harness(cwd);
+    cap.entries.push(
+      { id: "style-1", type: "custom_message", ...persisted },
+      { id: "kept", type: "message" },
+      { id: "compact", type: "compaction", firstKeptEntryId: "kept" },
+    );
+
+    await cap.handlers["session_switch"]({ reason: "resume" }, ctx);
+    const result = (await cap.handlers["before_agent_start"](
+      { prompt: "hi", systemPrompt: ["BASE"] },
+      ctx,
+    )) as { message: ReturnType<typeof buildStyleControlMessage> };
+    expect(result.message.content).toContain("Output style: teacher");
   });
 
   test("/style off --save clears the saved user default", async () => {
